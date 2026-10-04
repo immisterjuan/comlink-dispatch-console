@@ -2,6 +2,8 @@
 // src/assets/leaflet/trackerIcons.ts + src/config/trackerTypes.ts).
 // All remote tracker badges share one green background; only the icon varies.
 
+import type { UserStatus } from '../types';
+
 export interface TrackerBadge {
   color: string;
   fg: string;
@@ -49,3 +51,36 @@ export const TRACKER_TYPE_BADGES: Record<string, TrackerBadge> = Object.keys(TYP
 
 export const getTrackerBadge = (type?: string): TrackerBadge =>
   TRACKER_TYPE_BADGES[type || 'person'] || TRACKER_TYPE_BADGES.person;
+
+export const TRACKER_TYPE_NAMES: string[] = Object.keys(TYPE_ICONS);
+
+// Marker colors by live status (refactor.md §5).
+export const STATUS_COLORS: Record<UserStatus, string> = {
+  connecting: '#4CAF50',
+  active: '#4CAF50',
+  stop: '#FFEB3B',
+  idle: '#FFEB3B',
+  away: '#9E9E9E',
+  sos: '#F44336',
+};
+
+export const statusColor = (status?: UserStatus | null): string | undefined =>
+  status ? STATUS_COLORS[status] : undefined;
+
+// Display labels for live statuses (+ the "no data" bucket) — shared by the
+// Dashboard KPIs and the Users table.
+export type StatusKey = UserStatus | 'unknown';
+
+export const STATUS_LABELS: Record<StatusKey, string> = {
+  sos: 'SOS',
+  active: 'Active',
+  connecting: 'Connecting',
+  stop: 'Stop',
+  idle: 'Idle',
+  away: 'Away',
+  unknown: 'No Status',
+};
+
+// Foreground icon color that stays legible on a given background.
+export const contrastForeground = (background: string, fallback: string): string =>
+  background === '#FFEB3B' ? '#111111' : fallback;

@@ -1,3 +1,5 @@
+export type UserStatus = 'connecting' | 'active' | 'stop' | 'sos' | 'idle' | 'away';
+
 export type MarkerType =
   | 'default'
   | 'flag'
@@ -14,6 +16,8 @@ export interface MarkerData {
   title: string;
   markerType?: MarkerType;
   type?: string;
+  status?: UserStatus | null;
+  badgeNumber?: string;
   battery?: number;
   isSOS?: boolean;
   isMoving?: boolean;

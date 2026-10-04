@@ -19,3 +19,6 @@ try {
 
 export const supabase = client;
 export const isSupabaseInitialized = initialized;
+
+// Realtime channel shared with the mobile app (also embedded in the Event QR).
+export const MAP_CHANNEL = import.meta.env.VITE_SUPABASE_CHANNEL || 'map-sync';

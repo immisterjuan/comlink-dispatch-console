@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { supabase } from '../supabaseClient';
-import type { MarkerData, GeoJsonData } from '../types';
+import { supabase, MAP_CHANNEL } from '../supabaseClient';
+import type { MarkerData, GeoJsonData, UserStatus } from '../types';
+import { fetchLiveMarkers, normalizeStatus } from '../lib/db';
 import { get, set } from 'idb-keyval';
 
 const DISCONNECT_STATUSES = new Set(['disconnected', 'disconnect', 'offline', 'logout', 'logged_out']);
@@ -10,19 +11,39 @@ const DISCONNECT_STATUSES = new Set(['disconnected', 'disconnect', 'offline', 'l
 const STALENESS_THRESHOLD_MS = 6.5 * 60_000;
 const GHOST_EVICTION_MS = 30 * 60_000;
 
+// A device that drops out of presence is removed after a short grace period,
+// unless it keeps broadcasting from the background (mobile-status /
+// background-location) — in which case it stays until the staleness thresholds.
+const LEAVE_REMOVAL_GRACE_MS = 10_000;
+
 const isPin = (m: MarkerData) => m.markerType === 'default' || m.markerType === 'flag';
+
+// Ignore sub-threshold GPS drift so a stationary tracker doesn't shake.
+const POSITION_DEADBAND_M = 10;
+
+const approxDistanceM = (lat1: number, lng1: number, lat2: number, lng2: number) => {
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const x = toRad(lng2 - lng1) * Math.cos(toRad((lat1 + lat2) / 2));
+  const y = toRad(lat2 - lat1);
+  return Math.sqrt(x * x + y * y) * 6_371_000;
+};
 
 // Copy only the fields an update actually carries, so partial payloads
 // (mobile-status has no battery/type/SOS) never wipe existing data.
 const mergeMarker = (base: MarkerData, update: MarkerData): MarkerData => {
   const next: MarkerData = { ...base };
   if (update.lat !== undefined && update.lng !== undefined) {
-    next.lat = update.lat;
-    next.lng = update.lng;
+    // Dead-band: only accept a move that exceeds the drift threshold.
+    if (approxDistanceM(base.lat, base.lng, update.lat, update.lng) >= POSITION_DEADBAND_M) {
+      next.lat = update.lat;
+      next.lng = update.lng;
+    }
   }
   if (update.title) next.title = update.title;
   if (update.markerType) next.markerType = update.markerType;
   if (update.type !== undefined) next.type = update.type;
+  if (update.status !== undefined) next.status = update.status;
+  if (update.badgeNumber !== undefined) next.badgeNumber = update.badgeNumber;
   if (update.battery !== undefined) next.battery = update.battery;
   if (update.isSOS !== undefined) next.isSOS = update.isSOS;
   if (update.isMoving !== undefined) next.isMoving = update.isMoving;
@@ -39,6 +60,13 @@ export const useMapSync = (role: 'dispatch' | 'kiosk') => {
   // Local receipt time of each tracker's last update (mirrors the mobile
   // app's lastSeenRef): drives the offline / eviction thresholds.
   const lastSeenRef = React.useRef<Map<string, number>>(new Map());
+
+  // Presence bookkeeping for disconnect detection.
+  const presentIdsRef = React.useRef<Set<string>>(new Set());
+  const pendingLeaveRemovalsRef = React.useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  // Devices that left presence but are still broadcasting from the background:
+  // they are governed by the staleness thresholds instead of being removed.
+  const httpAliveIdsRef = React.useRef<Set<string>>(new Set());
 
   // Fetch remote GeoJSON overlay on mount
   useEffect(() => {
@@ -133,6 +161,39 @@ export const useMapSync = (role: 'dispatch' | 'kiosk') => {
     }
   }, [role]);
 
+  // Hydrate from Postgres on boot (flattened users + connected_users JOIN)
+  // so the map has last known positions before any broadcast arrives.
+  // Dispatch mirrors the result back into IndexedDB (refactor.md §2).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const live = await fetchLiveMarkers();
+        if (cancelled || live.length === 0) return;
+        setMarkers(prev => {
+          const liveIds = new Set(live.map(m => m.id));
+          const next = [
+            ...prev.filter(isPin),
+            ...live,
+            ...prev.filter(m => !isPin(m) && !liveIds.has(m.id)),
+          ];
+          live.forEach(m => {
+            if (!lastSeenRef.current.has(m.id)) {
+              lastSeenRef.current.set(m.id, m.updatedAt ?? Date.now());
+            }
+          });
+          if (role === 'dispatch') void set('markers', next);
+          return next;
+        });
+      } catch (e) {
+        console.error('Postgres hydration failed', e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [role]);
+
 
 
   const broadcastUpdate = useCallback(async (newMarkers: MarkerData[], newGeojsons: GeoJsonData[]) => {
@@ -145,7 +206,7 @@ export const useMapSync = (role: 'dispatch' | 'kiosk') => {
     }
 
     if (!supabase) return;
-    await supabase.channel('map-sync').send({
+    await supabase.channel(MAP_CHANNEL).send({
       type: 'broadcast',
       event: 'update-map',
       payload: { markers: newMarkers, geojsons: newGeojsons }
@@ -160,40 +221,109 @@ export const useMapSync = (role: 'dispatch' | 'kiosk') => {
     latestState.current = { markers, geojsons };
   }, [markers, geojsons]);
 
+  // Re-center the view when a unit first enters SOS (rising edge only, so
+  // ongoing SOS updates don't fight the operator's manual panning).
+  const centerOnSos = useCallback((id: string, lat: number, lng: number) => {
+    const before = latestState.current.markers.find(m => m.id === id);
+    if (before?.isSOS) return;
+    setFocusLocation({ lat, lng });
+  }, []);
+
+  const cancelLeaveRemoval = useCallback((id: string) => {
+    const timer = pendingLeaveRemovalsRef.current.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      pendingLeaveRemovalsRef.current.delete(id);
+    }
+  }, []);
+
   const removeMarker = useCallback((id?: string) => {
     if (!id) return;
+    cancelLeaveRemoval(id);
+    httpAliveIdsRef.current.delete(id);
     lastSeenRef.current.delete(id);
     setMarkers(prev => {
       const updated = prev.filter(m => m.id !== id);
       if (role === 'dispatch') set('markers', updated).catch(console.error);
       return updated;
     });
-  }, [role]);
+  }, [role, cancelLeaveRemoval]);
+
+  const scheduleLeaveRemoval = useCallback((id: string) => {
+    if (pendingLeaveRemovalsRef.current.has(id)) return;
+    const timer = setTimeout(() => {
+      pendingLeaveRemovalsRef.current.delete(id);
+      removeMarker(id);
+    }, LEAVE_REMOVAL_GRACE_MS);
+    pendingLeaveRemovalsRef.current.set(id, timer);
+  }, [removeMarker]);
 
   // Apply a tracker update from any source (presence / mobile-status /
-  // background-location): refresh liveness, create or merge the marker.
-  const upsertMarker = useCallback((update: MarkerData) => {
+  // background-location / user-* workflow broadcasts): refresh liveness,
+  // create or merge the marker. `persist` writes the result to IndexedDB
+  // (dispatch only) — used for significant state transitions, never for
+  // high-frequency movement ticks.
+  const upsertMarker = useCallback((update: MarkerData, persist = false) => {
     if (!update.id) return;
     if (update.lat === undefined || update.lng === undefined) return;
     lastSeenRef.current.set(update.id, Date.now());
+    // A live signal cancels any pending leave-removal; a signal from a device
+    // that is absent from presence marks it as background-alive.
+    cancelLeaveRemoval(update.id);
+    if (!presentIdsRef.current.has(update.id)) httpAliveIdsRef.current.add(update.id);
+    if (update.isSOS) centerOnSos(update.id, update.lat, update.lng);
 
     setMarkers(prev => {
       const idx = prev.findIndex(m => m.id === update.id);
-      if (idx === -1) return [...prev, { ...update, isOffline: false }];
+      if (idx === -1) {
+        const next = [...prev, { ...update, isOffline: false }];
+        if (persist && role === 'dispatch') void set('markers', next);
+        return next;
+      }
       const existing = prev[idx];
       const merged = { ...mergeMarker(existing, update), isOffline: false };
       if (
         merged.lat === existing.lat && merged.lng === existing.lng &&
         merged.title === existing.title && merged.type === existing.type &&
+        merged.status === existing.status && merged.badgeNumber === existing.badgeNumber &&
         merged.battery === existing.battery && merged.isSOS === existing.isSOS &&
         merged.isMoving === existing.isMoving && merged.markerType === existing.markerType &&
         merged.updatedAt === existing.updatedAt
       ) return prev;
       const next = prev.slice();
       next[idx] = merged;
+      if (persist && role === 'dispatch') void set('markers', next);
       return next;
     });
-  }, []);
+  }, [role, cancelLeaveRemoval, centerOnSos]);
+
+  // Mobile workflow broadcasts (refactor.md §4): user-active / user-moving /
+  // user-stopped / user-sos all carry the current position. user-moving is
+  // high-frequency, so its ticks are merged on the map but never persisted.
+  const handleTrackerEvent = useCallback((payload: any, fallbackStatus: UserStatus, persist: boolean) => {
+    const data = payload?.payload ?? payload;
+    if (!data) return;
+    const rawId = data.id ?? data.userUUID ?? data.user_id;
+    if (!rawId) return;
+    const lat = Number(data.lat);
+    const lng = Number(data.lng ?? data.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+
+    const status = normalizeStatus(data.status) ?? fallbackStatus;
+    const parsedTs = data.tsUpdated ? Date.parse(String(data.tsUpdated)) : NaN;
+    upsertMarker({
+      id: String(rawId),
+      lat,
+      lng,
+      title: data.name || data.title || 'Connected User',
+      badgeNumber: data.badge_number,
+      type: data.type,
+      status,
+      isSOS: status === 'sos',
+      isMoving: typeof data.isMoving === 'boolean' ? data.isMoving : status === 'active',
+      updatedAt: Number.isNaN(parsedTs) ? (data.updatedAt ?? undefined) : parsedTs
+    }, persist);
+  }, [upsertMarker]);
 
   const handleDisconnectEvent = useCallback((payload: any) => {
     const data = payload?.payload ?? payload;
@@ -203,7 +333,8 @@ export const useMapSync = (role: 'dispatch' | 'kiosk') => {
   useEffect(() => {
     if (!supabase) return;
 
-    const channel = supabase.channel('map-sync');
+    const pendingRemovals = pendingLeaveRemovalsRef.current;
+    const channel = supabase.channel(MAP_CHANNEL);
 
     channel
       .on('presence', { event: 'sync' }, () => {
@@ -211,6 +342,7 @@ export const useMapSync = (role: 'dispatch' | 'kiosk') => {
         let count = 0;
         const activeUsers: MarkerData[] = [];
         const fresh: MarkerData[] = [];
+        const presentIds = new Set<string>();
 
         Object.keys(state).forEach(key => {
           const clients: any[] = state[key];
@@ -225,6 +357,7 @@ export const useMapSync = (role: 'dispatch' | 'kiosk') => {
 
           const client = latest;
           const activeId = client.id || key;
+          presentIds.add(activeId);
           const lat = client.lat;
           const lng = client.lng ?? client.lon;
           if (lat === undefined || lng === undefined) return;
@@ -235,6 +368,7 @@ export const useMapSync = (role: 'dispatch' | 'kiosk') => {
             lng,
             title: client.title || client.name || 'Connected User',
             type: client.type,
+            status: normalizeStatus(client.status) ?? undefined,
             battery: client.battery,
             isSOS: client.isSOS === true || client.status === 'sos',
             isMoving: client.isMoving === true || client.status === 'moving',
@@ -249,9 +383,29 @@ export const useMapSync = (role: 'dispatch' | 'kiosk') => {
         setOnlineUsers(count);
         setPresenceUsers(activeUsers);
 
-        // A presence leave alone does NOT delete the marker: the device may
-        // still be broadcasting from the background (mobile-status /
-        // background-location). Liveness thresholds handle true disconnects.
+        // Disconnect detection: a device that drops out of presence is
+        // removed after a short grace period (explicit "Disconnect Tracker" /
+        // app kill / network loss). If it keeps broadcasting from the
+        // background it is kept and governed by the staleness thresholds
+        // instead — mirroring the mobile app's rationale.
+        presentIds.forEach(id => {
+          cancelLeaveRemoval(id);
+          httpAliveIdsRef.current.delete(id);
+        });
+        presentIdsRef.current.forEach(id => {
+          if (!presentIds.has(id) && !httpAliveIdsRef.current.has(id)) {
+            scheduleLeaveRemoval(id);
+          }
+        });
+        presentIdsRef.current = presentIds;
+
+        // A unit that just entered SOS recenters the view.
+        fresh.forEach(live => {
+          if (live.isSOS) centerOnSos(live.id, live.lat, live.lng);
+        });
+
+        // Merge the latest payload into the markers. Position/status updates
+        // only apply when the payload actually advanced (device re-tracked).
         setMarkers(prev => {
           let next = prev;
           let touched = false;
@@ -312,18 +466,24 @@ export const useMapSync = (role: 'dispatch' | 'kiosk') => {
 
         if (data.lat === undefined || data.lng === undefined) return;
 
+        // Only re-center when the tracker is first seen: following every
+        // update makes the map jump around (especially with several trackers).
+        const isNewMarker = !latestState.current.markers.some(m => m.id === data.id);
+
+        const legacyStatus = normalizeStatus(data.status);
         upsertMarker({
           id: data.id,
           lat: data.lat,
           lng: data.lng,
           title: data.title || 'Mobile User',
           type: data.type,
+          status: legacyStatus ?? undefined,
           battery: data.battery,
-          isSOS: data.isSOS === undefined ? undefined : !!data.isSOS,
+          isSOS: data.isSOS === undefined ? legacyStatus === 'sos' : !!data.isSOS,
           isMoving: typeof data.isMoving === 'boolean' ? data.isMoving : undefined
         });
 
-        setFocusLocation({ lat: data.lat, lng: data.lng });
+        if (isNewMarker) setFocusLocation({ lat: data.lat, lng: data.lng });
       })
       .on('broadcast', { event: 'background-location' }, (payload) => {
         // Background HTTP broadcasts from mobile trackers (5 min when
@@ -342,11 +502,26 @@ export const useMapSync = (role: 'dispatch' | 'kiosk') => {
           lng,
           title: data.name || data.title || 'Mobile User',
           type: data.type,
+          status: normalizeStatus(data.status) ?? undefined,
           battery: data.battery,
           isSOS: data.isSOS === undefined ? undefined : !!data.isSOS,
           isMoving: typeof data.isMoving === 'boolean' ? data.isMoving : undefined,
           updatedAt: data.updatedAt
         });
+      })
+      .on('broadcast', { event: 'user-active' }, (payload) => {
+        handleTrackerEvent(payload, 'active', true);
+      })
+      .on('broadcast', { event: 'user-moving' }, (payload) => {
+        // High-frequency telemetry: map only, no IndexedDB write.
+        handleTrackerEvent(payload, 'active', false);
+      })
+      .on('broadcast', { event: 'user-stopped' }, (payload) => {
+        // Final anchor — write the last position to the local database.
+        handleTrackerEvent(payload, 'stop', true);
+      })
+      .on('broadcast', { event: 'user-sos' }, (payload) => {
+        handleTrackerEvent(payload, 'sos', true);
       })
       .on('broadcast', { event: 'user-disconnect' }, handleDisconnectEvent)
       .on('broadcast', { event: 'disconnect' }, handleDisconnectEvent)
@@ -362,9 +537,11 @@ export const useMapSync = (role: 'dispatch' | 'kiosk') => {
       });
 
     return () => {
+      pendingRemovals.forEach(timer => clearTimeout(timer));
+      pendingRemovals.clear();
       supabase?.removeChannel(channel);
     };
-  }, [role, broadcastUpdate, removeMarker, handleDisconnectEvent, upsertMarker]);
+  }, [role, broadcastUpdate, removeMarker, handleDisconnectEvent, handleTrackerEvent, upsertMarker, cancelLeaveRemoval, scheduleLeaveRemoval, centerOnSos]);
 
   // Offline / eviction loop — same cadence and thresholds as the mobile app
   // (SupabaseContext.tsx): gray out after 6.5 min silent, drop after 30 min.
@@ -386,6 +563,8 @@ export const useMapSync = (role: 'dispatch' | 'kiosk') => {
           }
           if (now - lastSeen > GHOST_EVICTION_MS) {
             lastSeenRef.current.delete(m.id);
+            httpAliveIdsRef.current.delete(m.id);
+            cancelLeaveRemoval(m.id);
             changed = true;
             continue;
           }
@@ -402,7 +581,7 @@ export const useMapSync = (role: 'dispatch' | 'kiosk') => {
     }, 60_000);
 
     return () => clearInterval(interval);
-  }, []);
+  }, [cancelLeaveRemoval]);
 
   return { markers, geojsons, presenceUsers, broadcastUpdate, onlineUsers, focusLocation };
 };

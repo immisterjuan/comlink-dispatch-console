@@ -34,7 +34,7 @@ To provide fast offline reads and cache last known locations:
 The app now utilizes a strict, typing-free two-step activation sequence to prevent unauthorized access and eliminate duplicate ghost devices.
 
 1. **Step 1: Event Configuration (`DeviceSetupScreen`)**
-   - The user scans the **Event QR Code** (JSON containing `supabase_url`, `supabase_anon_key`, and `supabase_channel`).
+   - The user scans the **Event QR Code** (JSON containing `url`, `anonKey`, and `channel`).
    - The app now knows how to communicate with the database, but does not yet know *who* the user is.
 2. **Step 2: Device Activation (`RegistrationScreen`)**
    - The user scans their personal **Registration QR Code** (containing just their raw UUID).

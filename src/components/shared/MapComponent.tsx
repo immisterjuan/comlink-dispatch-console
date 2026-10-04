@@ -73,19 +73,58 @@ const MarkerVisibility = ({ hidden }: { hidden: boolean }) => {
   return null;
 };
 
-// The 1.5s transform glide is only for incoming position broadcasts — while
-// the map pans/zooms Leaflet rewrites every marker transform each frame, so
-// the transition is suspended for the interaction and markers stay pinned to
-// their geographic spot instead of lagging behind the tiles.
-const MarkerPanGuard = () => {
+// Reports the current zoom level so the parent can hide markers below the
+// visibility threshold (the pane-wide hide also covers GeoJSON point markers).
+const ZoomReporter = ({ onZoomChange }: { onZoomChange: (zoom: number) => void }) => {
+  const map = useMap();
+  useEffect(() => {
+    onZoomChange(map.getZoom());
+    const report = () => onZoomChange(map.getZoom());
+    map.on('zoomend', report);
+    map.on('load', report);
+    return () => {
+      map.off('zoomend', report);
+      map.off('load', report);
+    };
+  }, [map, onZoomChange]);
+  return null;
+};
+
+// The 1.5s transform glide is only for incoming position broadcasts — every
+// transform Leaflet itself writes (zoom resets, pinch frames, viewreset after
+// a resize) must land instantly, otherwise the marker drifts away from its
+// geographic spot. The glide is suspended for the whole interaction and only
+// re-enabled one frame later, because `_resetView` fires `moveend` and then
+// `viewreset` (the marker update) inside the same task.
+const MarkerTransitionGuard = () => {
   const map = useMap();
   useEffect(() => {
     const el = map.getContainer();
-    const suspend = () => el.classList.add('markers-panning');
-    const resume = () => el.classList.remove('markers-panning');
+    let raf = 0;
+    const suspend = () => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
+      el.classList.add('markers-panning');
+    };
+    const resume = () => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        el.classList.remove('markers-panning');
+        raf = 0;
+      });
+    };
+    // `viewreset` runs after `moveend` in the same task; suspending again here
+    // keeps the transition off for the final marker write (also covers resets
+    // that skip `viewprereset`, e.g. `map.stop()`).
+    const onViewReset = () => {
+      suspend();
+      resume();
+    };
     map.on('movestart', suspend);
     map.on('zoomstart', suspend);
     map.on('dragstart', suspend);
+    map.on('viewprereset', suspend);
+    map.on('viewreset', onViewReset);
     map.on('moveend', resume);
     map.on('zoomend', resume);
     map.on('dragend', resume);
@@ -93,9 +132,12 @@ const MarkerPanGuard = () => {
       map.off('movestart', suspend);
       map.off('zoomstart', suspend);
       map.off('dragstart', suspend);
+      map.off('viewprereset', suspend);
+      map.off('viewreset', onViewReset);
       map.off('moveend', resume);
       map.off('zoomend', resume);
       map.off('dragend', resume);
+      if (raf) cancelAnimationFrame(raf);
       el.classList.remove('markers-panning');
     };
   }, [map]);
@@ -364,6 +406,13 @@ const markerStyles = `
   .leaflet-container.markers-hidden .leaflet-marker-pane { opacity: 0; pointer-events: none; }
   .leaflet-container.markers-no-transition .leaflet-marker-icon { transition: none; }
   .leaflet-container.markers-panning .leaflet-marker-icon { transition: none; }
+  /* While Leaflet eases the map to a new zoom it eases tiles and markers with
+     this exact curve (the leaflet.css .leaflet-zoom-anim .leaflet-zoom-animated
+     rule); markers must keep it so they travel the same path as the tiles
+     instead of snapping ahead of them. Higher specificity than the
+     markers-panning rule above so it also wins while the transition is
+     suspended. */
+  .leaflet-zoom-anim .leaflet-marker-pane .leaflet-marker-icon { transition: transform 0.25s cubic-bezier(0,0,0.25,1); }
   .map-user-marker { width: 36px; height: 36px; display: flex; justify-content: center; align-items: center; }
   .glow-wrapper { position: absolute; width: 100%; height: 100%; opacity: 0; transition: opacity 2s ease-out; }
   .map-user-marker.is-moving .glow-wrapper { opacity: 1; transition: opacity 0.2s ease-in; }
@@ -500,8 +549,14 @@ const SosBanner = ({ markers }: { markers: MarkerData[] }) => {
 
 const isPinMarker = (m: MarkerData) => m.markerType === 'default' || m.markerType === 'flag';
 
+const INITIAL_ZOOM = 6;
+// Markers are hidden as soon as the map zooms out below this level.
+const MIN_MARKER_ZOOM = 13;
+
 const MapComponent: React.FC<MapComponentProps> = ({ markers, geojsons, onClick, interactive = true, focusLocation }) => {
   const [flying, setFlying] = useState(false);
+  const [zoom, setZoom] = useState(INITIAL_ZOOM);
+  const markersHidden = flying || zoom < MIN_MARKER_ZOOM;
 
   // SOS focus (refactor.md §4): while any tracker is in SOS, every other
   // marker is hidden so the operator sees only the SOS broadcast.
@@ -512,7 +567,7 @@ const MapComponent: React.FC<MapComponentProps> = ({ markers, geojsons, onClick,
     <div className="map-shell">
       <MapContainer 
         center={[12.8797, 121.7740]} 
-        zoom={6} 
+        zoom={INITIAL_ZOOM} 
         style={{ flex: 1, width: '100%', minHeight: 0 }}
         dragging
         keyboard={false}
@@ -523,8 +578,9 @@ const MapComponent: React.FC<MapComponentProps> = ({ markers, geojsons, onClick,
       >
       <style>{markerStyles}</style>
       <MapFlyTo location={focusLocation} onFlyStateChange={setFlying} />
-      <MarkerVisibility hidden={flying} />
-      <MarkerPanGuard />
+      <MarkerVisibility hidden={markersHidden} />
+      <ZoomReporter onZoomChange={setZoom} />
+      <MarkerTransitionGuard />
       <MapResizeWatcher />
       <NorthArrow />
       <SosBanner markers={markers} />

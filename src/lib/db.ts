@@ -1,4 +1,4 @@
-import { supabase } from '../supabaseClient';
+import { supabase, MAP_CHANNEL } from '../supabaseClient';
 import type { MarkerData, UserStatus } from '../types';
 
 // Postgres access for the normalized schema (refactor.md §1):
@@ -239,7 +239,7 @@ export const registerSelf = async (input: {
 // reach the database. The Registration QR is just the raw user UUID.
 export const eventQrPayload = (): string =>
   JSON.stringify({
-    supabase_url: import.meta.env.VITE_SUPABASE_URL || '',
-    supabase_anon_key: import.meta.env.VITE_SUPABASE_ANON_KEY || '',
-    supabase_channel: import.meta.env.VITE_SUPABASE_CHANNEL || 'map-sync',
+    url: import.meta.env.VITE_SUPABASE_URL || '',
+    anonKey: import.meta.env.VITE_SUPABASE_ANON_KEY || '',
+    channel: MAP_CHANNEL,
   });
